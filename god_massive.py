@@ -2,23 +2,360 @@ import pygame
 import numpy as np
 import sys
 import random
-from god import EvolutionStrategy, NeuralNetwork, GRID_WIDTH, GRID_HEIGHT, POPULATION_SIZE
+import json
+import os
 
-# Constants
-GAME_SIZE = 32
+# ==================== CONSTANTS ====================
+GRID_WIDTH = 128
+GRID_HEIGHT = 128
+MAX_GENERATIONS = 100
+POPULATION_SIZE = 50
+LEARNING_RATE = 0.1  # ES learning rate
+SIGMA = 0.1  # Noise standard deviation for ES
+
+GAME_SIZE = 128
 SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 FPS = 60
-MAX_AGE = 600 # Max frames before forced death (10 seconds)
+MAX_AGE = 6000 # Max frames before forced death (10 seconds)
 STAGNATION_THRESHOLD = 20 # Increased to 20 to kill more complex oscillators
 STAGNATION_LIMIT = 20 # Reduced to 20 frames (0.3s) for faster cleanup
-
 
 # Colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 GREEN = (50, 255, 50)
 
+# ==================== NEURAL NETWORK ====================
+class NeuralNetwork:
+    def __init__(self, input_size=4, hidden_size=16, output_size=1):
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        
+        # Weights and Biases
+        self.w1 = np.random.randn(input_size, hidden_size)
+        self.b1 = np.random.randn(hidden_size)
+        self.w2 = np.random.randn(hidden_size, output_size)
+        self.b2 = np.random.randn(output_size)
+
+    def forward(self, inputs):
+        # inputs shape: (N, input_size)
+        self.z1 = np.dot(inputs, self.w1) + self.b1
+        self.a1 = np.tanh(self.z1) # Tanh activation
+        self.z2 = np.dot(self.a1, self.w2) + self.b2
+        self.a2 = 1 / (1 + np.exp(-self.z2)) # Sigmoid activation
+        return self.a2
+
+    def get_genome(self):
+        return np.concatenate([
+            self.w1.flatten(),
+            self.b1.flatten(),
+            self.w2.flatten(),
+            self.b2.flatten()
+        ])
+
+    def set_genome(self, genome):
+        idx = 0
+        
+        w1_end = idx + self.input_size * self.hidden_size
+        self.w1 = genome[idx:w1_end].reshape(self.input_size, self.hidden_size)
+        idx = w1_end
+        
+        b1_end = idx + self.hidden_size
+        self.b1 = genome[idx:b1_end]
+        idx = b1_end
+        
+        w2_end = idx + self.hidden_size * self.output_size
+        self.w2 = genome[idx:w2_end].reshape(self.hidden_size, self.output_size)
+        idx = w2_end
+        
+        b2_end = idx + self.output_size
+        self.b2 = genome[idx:b2_end]
+
+    def mutate(self):
+        """Legacy method for compatibility - adds Gaussian noise"""
+        genome = self.get_genome()
+        noise = np.random.randn(*genome.shape) * 0.1
+        self.set_genome(genome + noise)
+
+# ==================== EVOLUTION STRATEGY ====================
+class EvolutionStrategy:
+    """Natural Evolution Strategies (NES) optimizer"""
+    def __init__(self):
+        # Mean network (what we're optimizing)
+        self.mean_network = NeuralNetwork()
+        self.mean_genome = self.mean_network.get_genome()
+        self.genome_size = len(self.mean_genome)
+        
+        self.generation = 0
+        self.best_fitness = 0
+        self.fitness_history = []
+        
+        # For compatibility with existing code
+        self.best_genome = None
+        
+        # Precompute coordinates for the grid
+        x = np.linspace(-1, 1, GRID_WIDTH)
+        y = np.linspace(-1, 1, GRID_HEIGHT)
+        xv, yv = np.meshgrid(x, y)
+        
+        # Calculate distance from center
+        dist = np.sqrt(xv**2 + yv**2)
+        
+        # Flatten and stack: (N, 3) -> x, y, dist
+        self.base_inputs = np.column_stack([xv.flatten(), yv.flatten(), dist.flatten()])
+
+    def generate_grid(self, network):
+        """Generate a GoL seed grid from a neural network"""
+        noise = np.random.randn(self.base_inputs.shape[0], 1) * 0.5
+        inputs = np.hstack([self.base_inputs, noise])
+        
+        # Vectorized forward pass for all cells
+        outputs = network.forward(inputs)
+        grid = (outputs > 0.5).astype(np.int8).reshape(GRID_HEIGHT, GRID_WIDTH)
+        return grid
+
+    def evaluate(self, network):
+        """Evaluate a network's generated seed using GoL Complexity Metric (GCM)"""
+        grid = self.generate_grid(network)
+        
+        # Simulate trajectory and collect frames
+        frames = [grid.copy()]
+        for _ in range(MAX_GENERATIONS):
+            current = frames[-1]
+            
+            # Game of Life step
+            N = (np.roll(current, 1, axis=0) + np.roll(current, -1, axis=0) +
+                 np.roll(current, 1, axis=1) + np.roll(current, -1, axis=1) +
+                 np.roll(np.roll(current, 1, axis=0), 1, axis=1) +
+                 np.roll(np.roll(current, 1, axis=0), -1, axis=1) +
+                 np.roll(np.roll(current, -1, axis=0), 1, axis=1) +
+                 np.roll(np.roll(current, -1, axis=0), -1, axis=1))
+            
+            birth = (N == 3) & (current == 0)
+            survive = ((N == 2) | (N == 3)) & (current == 1)
+            new_grid = np.zeros_like(current)
+            new_grid[birth | survive] = 1
+            
+            frames.append(new_grid)
+            
+            # Early stopping
+            if np.sum(new_grid) == 0:
+                break
+            if len(frames) > 2 and np.array_equal(frames[-1], frames[-2]):
+                break
+        
+        # Compute GCM
+        return self.gol_complexity_metric(frames)
+    
+    # ==================== GCM HELPER FUNCTIONS ====================
+    
+    def cell_density(self, F):
+        """Fraction of alive cells"""
+        return np.sum(F) / F.size
+    
+    def activity(self, F_prev, F_curr):
+        """Fraction of cells that changed"""
+        return np.sum(F_prev != F_curr) / F_prev.size
+    
+    def extract_patches(self, F, k=8):
+        """Extract all k x k non-overlapping patches"""
+        H, W = F.shape
+        patches = []
+        for y in range(0, H, k):
+            for x in range(0, W, k):
+                if y + k <= H and x + k <= W:
+                    patch = F[y:y+k, x:x+k]
+                    patches.append(tuple(patch.flatten().tolist()))
+        return patches
+    
+    def patch_uniqueness(self, F, k=8):
+        """Unique patch fraction (diversity)"""
+        patches = self.extract_patches(F, k)
+        if not patches:
+            return 0.0
+        return len(set(patches)) / len(patches)
+    
+    def patch_type_set(self, F, k=8):
+        """Set of unique patch types"""
+        return set(self.extract_patches(F, k))
+    
+    def patch_overlap(self, F_prev, F_curr, k=8):
+        """Jaccard overlap of patch types between frames"""
+        A = self.patch_type_set(F_prev, k)
+        B = self.patch_type_set(F_curr, k)
+        if not A and not B:
+            return 1.0
+        if not A or not B:
+            return 0.0
+        inter = len(A & B)
+        union = len(A | B)
+        return inter / union
+    
+    # ==================== GOODNESS FUNCTIONS ====================
+    
+    def density_goodness(self, rho):
+        """Reward mid-density (parabola peaked at 0.5)"""
+        return 4 * rho * (1 - rho)
+    
+    def activity_goodness(self, a, mu=0.2, sigma=0.1):
+        """Reward moderate activity (Gaussian)"""
+        if sigma <= 0:
+            return 0.0
+        z = (a - mu) / sigma
+        return np.exp(-0.5 * z * z)
+    
+    def type_diversity_goodness(self, u):
+        """Reward mid-range uniqueness"""
+        return 4 * u * (1 - u)
+    
+    def overlap_goodness(self, o):
+        """Reward high motif persistence"""
+        return o
+    
+    def frame_complexity(self, F_prev, F_curr, k=8,
+                        alpha=0.2, beta=0.3, gamma=0.3, delta=0.2):
+        """Compute complexity score for a single frame transition"""
+        rho = self.cell_density(F_curr)
+        a = self.activity(F_prev, F_curr)
+        u = self.patch_uniqueness(F_curr, k)
+        o = self.patch_overlap(F_prev, F_curr, k)
+        
+        g_cells = self.density_goodness(rho)
+        g_activity = self.activity_goodness(a)
+        g_types = self.type_diversity_goodness(u)
+        g_overlap = self.overlap_goodness(o)
+        
+        return (alpha * g_cells +
+                beta * g_activity +
+                gamma * g_types +
+                delta * g_overlap)
+    
+    def gol_complexity_metric(self, frames, k=8,
+                             alpha=0.2, beta=0.3, gamma=0.3, delta=0.2,
+                             burnin_fraction=1/3):
+        """
+        Compute GoL Complexity Metric (GCM) for entire trajectory.
+        
+        Returns a scalar in [0,1] that is:
+        - Low for trivial worlds (empty, still-lifes)
+        - Low-medium for chaos/noise
+        - High for structured dynamics (gliders, guns, circuits)
+        """
+        T = len(frames) - 1
+        if T <= 0:
+            return 0.0
+        
+        B = int(T * burnin_fraction)  # Skip early transients
+        scores = []
+        
+        for t in range(max(1, B), T + 1):
+            F_prev = frames[t-1]
+            F_curr = frames[t]
+            s = self.frame_complexity(F_prev, F_curr, k,
+                                     alpha=alpha, beta=beta,
+                                     gamma=gamma, delta=delta)
+            scores.append(s)
+        
+        if not scores:
+            return 0.0
+        
+        # Average complexity over non-burnin frames
+        avg_complexity = np.mean(scores)
+        
+        # Scale to make scores more meaningful (0-100 range)
+        return avg_complexity * 100
+
+    def evolve(self):
+        """Run one generation of ES optimization"""
+        # Sample population from Gaussian around mean
+        noise_vectors = []
+        networks = []
+        
+        for _ in range(POPULATION_SIZE):
+            noise = np.random.randn(self.genome_size) * SIGMA
+            noise_vectors.append(noise)
+            
+            network = NeuralNetwork()
+            network.set_genome(self.mean_genome + noise)
+            networks.append(network)
+        
+        # Evaluate all networks
+        fitness_scores = np.array([self.evaluate(net) for net in networks])
+        
+        # Track best
+        best_idx = np.argmax(fitness_scores)
+        if fitness_scores[best_idx] > self.best_fitness:
+            self.best_fitness = fitness_scores[best_idx]
+            self.best_genome = self.mean_genome + noise_vectors[best_idx]
+        
+        # Fitness-weighted gradient estimation
+        if np.std(fitness_scores) > 0:
+            normalized_fitness = (fitness_scores - np.mean(fitness_scores)) / (np.std(fitness_scores) + 1e-8)
+        else:
+            normalized_fitness = fitness_scores
+        
+        # Estimate gradient
+        gradient = np.zeros(self.genome_size)
+        for i in range(POPULATION_SIZE):
+            gradient += normalized_fitness[i] * noise_vectors[i]
+        gradient /= (POPULATION_SIZE * SIGMA)
+        
+        # Update mean genome
+        self.mean_genome += LEARNING_RATE * gradient
+        self.mean_network.set_genome(self.mean_genome)
+        
+        # Update history
+        avg_fitness = np.mean(fitness_scores)
+        self.fitness_history.append({
+            'generation': self.generation,
+            'best_fitness': self.best_fitness,
+            'avg_fitness': avg_fitness
+        })
+        
+        self.generation += 1
+        
+        print(f"Gen {self.generation}: Best Fitness = {self.best_fitness:.2f}, Avg = {avg_fitness:.2f}")
+        
+        return self.best_fitness
+
+    def save(self, filename="god_brain_es.json"):
+        """Save the current ES state to disk"""
+        data = {
+            'mean_genome': self.mean_genome.tolist(),
+            'best_genome': self.best_genome.tolist() if self.best_genome is not None else None,
+            'best_fitness': float(self.best_fitness),
+            'generation': self.generation,
+            'fitness_history': self.fitness_history
+        }
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved to {filename}")
+    
+    def load(self, filename="god_brain_es.json"):
+        """Load ES state from disk"""
+        if not os.path.exists(filename):
+            print(f"No save file found at {filename}")
+            return False
+        
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        
+        self.mean_genome = np.array(data['mean_genome'])
+        self.mean_network.set_genome(self.mean_genome)
+        
+        if data['best_genome'] is not None:
+            self.best_genome = np.array(data['best_genome'])
+        
+        self.best_fitness = data['best_fitness']
+        self.generation = data['generation']
+        self.fitness_history = data['fitness_history']
+        
+        print(f"Loaded from {filename} - Generation {self.generation}, Best Fitness: {self.best_fitness:.2f}")
+        return True
+
+# ==================== MASSIVE GOD MODE ====================
 class MassiveGodMode:
     def __init__(self):
         pygame.init()
@@ -42,7 +379,6 @@ class MassiveGodMode:
         self.grid = np.zeros((self.sim_height, self.sim_width), dtype=np.int8)
         
         # Stats Arrays (Vectorized tracking)
-        # Shape: (rows, cols)
         self.stats_age = np.zeros((self.rows, self.cols), dtype=np.int32)
         self.stats_stagnation = np.zeros((self.rows, self.cols), dtype=np.int32)
         self.stats_initial_pop = np.zeros((self.rows, self.cols), dtype=np.int32)
@@ -50,21 +386,16 @@ class MassiveGodMode:
         self.stats_alive = np.ones((self.rows, self.cols), dtype=bool)
         
         # Population Management
-        # We keep a "Hall of Fame" of genomes to breed from
         self.hall_of_fame = []
         self.best_fitness_ever = 0
         
-        # Active Genomes Grid (to track which network is where)
+        # Active Genomes Grid
         self.active_genomes = [[NeuralNetwork() for _ in range(self.cols)] for _ in range(self.rows)]
         
         # Isolation Mask (Void Barriers)
-        # 1 = Alive allowed, 0 = Dead zone
         self.isolation_mask = np.ones((self.sim_height, self.sim_width), dtype=np.int8)
         
         # Create dead zones at borders
-        # We want a 1px border around each GAME_SIZE block
-        # Actually, just the edges of each block.
-        # Vertical lines
         for c in range(self.cols + 1):
             x = c * GAME_SIZE
             if x < self.sim_width:
@@ -72,7 +403,6 @@ class MassiveGodMode:
             if x - 1 >= 0:
                 self.isolation_mask[:, x-1] = 0
                 
-        # Horizontal lines
         for r in range(self.rows + 1):
             y = r * GAME_SIZE
             if y < self.sim_height:
@@ -82,14 +412,12 @@ class MassiveGodMode:
                 
         # Pre-render Grid Overlay
         self.grid_overlay = pygame.Surface((self.sim_width, self.sim_height), pygame.SRCALPHA)
-        grid_color = (30, 30, 30) # Faint grey
+        grid_color = (30, 30, 30)
         
-        # Vertical lines
         for c in range(1, self.cols):
             x = c * GAME_SIZE
             pygame.draw.line(self.grid_overlay, grid_color, (x, 0), (x, self.sim_height))
             
-        # Horizontal lines
         for r in range(1, self.rows):
             y = r * GAME_SIZE
             pygame.draw.line(self.grid_overlay, grid_color, (0, y), (self.sim_width, y))
@@ -101,43 +429,31 @@ class MassiveGodMode:
                 self.reset_game(r, c, initial=True)
 
     def reset_game(self, r, c, initial=False, target_grid=None):
-        # Create new child
         child = NeuralNetwork()
         
         if not initial and len(self.hall_of_fame) > 2:
-            # Breed from Hall of Fame
-            # Tournament selection
             parents = random.sample(self.hall_of_fame, min(len(self.hall_of_fame), 5))
             parents.sort(key=lambda x: x[0], reverse=True)
-            parent_genome = parents[0][1] # Best of sample
+            parent_genome = parents[0][1]
             
             child.set_genome(parent_genome)
             child.mutate()
         elif not initial:
-             # Random mutation of current best if HoF is small
              if self.es.best_genome is not None:
                  child.set_genome(self.es.best_genome)
                  child.mutate()
         
         self.active_genomes[r][c] = child
-        
-        # Generate Seed  
         seed = self.es.generate_grid(child)
         
-        # Place in grid
         y = r * GAME_SIZE
         x = c * GAME_SIZE
         
-        # Determine which grid to write to
         if target_grid is None:
             target_grid = self.grid
 
-        # Apply mask to seed to ensure it doesn't start in void
-        # (Though seed is 32x32 and we might have masked edges)
-        # Let's just place it and let the mask kill edges next frame
         target_grid[y:y+GAME_SIZE, x:x+GAME_SIZE] = seed
         
-        # Reset Stats
         self.stats_age[r, c] = 0
         self.stats_stagnation[r, c] = 0
         self.stats_initial_pop[r, c] = np.sum(seed)
@@ -145,7 +461,7 @@ class MassiveGodMode:
         self.stats_alive[r, c] = True
 
     def update(self):
-        # 1. Global Game of Life Update (NumPy Optimized)
+        # Game of Life Update
         current_grid = self.grid
         N = (np.roll(current_grid, 1, axis=0) + np.roll(current_grid, -1, axis=0) +
              np.roll(current_grid, 1, axis=1) + np.roll(current_grid, -1, axis=1) +
@@ -159,78 +475,55 @@ class MassiveGodMode:
         new_grid = np.zeros_like(current_grid)
         new_grid[birth | survive] = 1
         
-        # Apply Void Barriers (Bitwise AND is faster than multiplication for 0/1)
         new_grid &= self.isolation_mask
         
-        # 2. Calculate Metrics per Game (Vectorized)
-        # Reshape to (rows, GAME_SIZE, cols, GAME_SIZE) to sum per block
-        # We want to sum over axis 1 and 3 (the internal block dimensions)
-        
-        # Activity
+        # Calculate Metrics
         changed = (current_grid != new_grid).astype(np.int32)
         reshaped_changed = changed.reshape(self.rows, GAME_SIZE, self.cols, GAME_SIZE)
         activity_per_game = reshaped_changed.sum(axis=(1, 3))
         
-        # Population
         reshaped_new = new_grid.reshape(self.rows, GAME_SIZE, self.cols, GAME_SIZE)
         pop_per_game = reshaped_new.sum(axis=(1, 3))
         
-        # 3. Update Stats Arrays
+        # Update Stats
         self.stats_age += 1
         self.stats_activity_accum += activity_per_game
         
-        # Stagnation Check
-        # If activity is low, increment stagnation counter. Else reset it.
         is_stagnant = activity_per_game < STAGNATION_THRESHOLD
         self.stats_stagnation[is_stagnant] += 1
         self.stats_stagnation[~is_stagnant] = 0
         
-        # 4. Identify Dead/Stagnant Games
-        # Conditions for reset:
-        # - Population is 0 (Dead)
-        # - Stagnation > Limit (Boring)
-        # - Age > Max (Old age death to make room)
-        
+        # Identify Dead/Stagnant Games
         dead_mask = (pop_per_game == 0)
         stagnant_mask = (self.stats_stagnation > STAGNATION_LIMIT)
         old_mask = (self.stats_age > MAX_AGE)
         
         reset_mask = dead_mask | stagnant_mask | old_mask
         
-        # 5. Process Resets (Python Loop but only for resetting games)
-        # Get indices of games to reset
+        # Process Resets
         rows_to_reset, cols_to_reset = np.where(reset_mask)
         
-        # Debug Backlog
         if hasattr(self, 'frame_count') and self.frame_count % 60 == 0 and len(rows_to_reset) > 0:
             print(f"Reset Queue: {len(rows_to_reset)} games waiting.")
         elif not hasattr(self, 'frame_count'):
              self.frame_count = 0
         self.frame_count += 1
 
-        # Limit resets per frame to prevent lag spikes
-        MAX_RESETS = 100 # Increased to 100 to clear backlog instantly
+        MAX_RESETS = 100
         if len(rows_to_reset) > MAX_RESETS:
-            # Randomly select subset to reset
             indices = np.random.choice(len(rows_to_reset), MAX_RESETS, replace=False)
             rows_to_reset = rows_to_reset[indices]
             cols_to_reset = cols_to_reset[indices]
         
         if len(rows_to_reset) > 0:
-            # Calculate Spread (Bounding Box) only for finishing games
-            # This is expensive so we only do it here
-            
             for i in range(len(rows_to_reset)):
                 r, c = rows_to_reset[i], cols_to_reset[i]
                 
-                # Calculate Fitness
                 final_pop = pop_per_game[r, c]
                 initial_pop = self.stats_initial_pop[r, c]
                 duration = self.stats_age[r, c]
                 total_activity = self.stats_activity_accum[r, c]
                 
-                # Spread Calculation
-                # Extract grid for this game
                 y, x = r * GAME_SIZE, c * GAME_SIZE
                 game_grid = new_grid[y:y+GAME_SIZE, x:x+GAME_SIZE]
                 
@@ -242,58 +535,45 @@ class MassiveGodMode:
                         w = np.max(cols) - np.min(cols) + 1
                         spread = (h * w) / (GAME_SIZE * GAME_SIZE)
                 
-                # Fitness Formula
-                score = duration *1.0
+                score = duration * 1.0
                 score += total_activity * 0.5
                 if initial_pop > 0:
                     score += (final_pop / initial_pop) * 10.0
                 score += spread * 50.0
                 
-                # Penalties
                 if initial_pop == 0: score -= 100
                 elif total_activity < 5: score -= 50
                 
                 score = max(score, 0)
                 
-                # Update Hall of Fame
-                if score > 100: # Min threshold to enter
+                if score > 100:
                     genome = self.active_genomes[r][c].get_genome()
                     self.hall_of_fame.append((score, genome))
-                    # Keep HoF size manageable
                     if len(self.hall_of_fame) > 100:
                         self.hall_of_fame.sort(key=lambda x: x[0], reverse=True)
-                        self.hall_of_fame = self.hall_of_fame[:50] # Keep top 50
+                        self.hall_of_fame = self.hall_of_fame[:50]
                 
                 if score > self.best_fitness_ever:
                     self.best_fitness_ever = score
                 
-                # Reset the game
                 self.reset_game(r, c, target_grid=new_grid)
         
-        # Apply grid update
         self.grid = new_grid
 
     def draw(self):
-        # Render
         rgb_array = np.zeros((self.sim_width, self.sim_height, 3), dtype=np.uint8)
         grid_t = self.grid.T
-        
-        # White cells
         rgb_array[grid_t == 1] = [255, 255, 255]
         
         pygame.surfarray.blit_array(self.screen, rgb_array)
-        
-        # Draw Grid Overlay (Pre-rendered)
         self.screen.blit(self.grid_overlay, (0, 0))
         
-        # Overlay
         text = self.font.render(f"Best Fitness: {self.best_fitness_ever:.0f} | HoF Size: {len(self.hall_of_fame)}", True, GREEN)
         self.screen.blit(text, (20, 20))
         
         pygame.display.flip()
 
     def run(self):
-        # Try to load existing progress
         self.es.load()
         
         running = True
@@ -313,14 +593,12 @@ class MassiveGodMode:
                 self.clock.tick(FPS)
                 
                 frame_counter += 1
-                # Auto-save every 600 frames (10 seconds at 60 FPS)
                 if frame_counter % 600 == 0:
                     self.es.save()
         except KeyboardInterrupt:
             print("\nSaving progress...")
             self.es.save()
 
-        # Save on exit
         self.es.save()
         pygame.quit()
         sys.exit()
