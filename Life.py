@@ -13,18 +13,22 @@ POPULATION_SIZE = 50
 LEARNING_RATE = 0.1  # ES learning rate
 SIGMA = 0.1  # Noise standard deviation for ES
 
+# Constants
 GAME_SIZE = 128
 SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 FPS = 60
-MAX_AGE = 6000 # Max frames before forced death (10 seconds)
-STAGNATION_THRESHOLD = 20 # Increased to 20 to kill more complex oscillators
-STAGNATION_LIMIT = 20 # Reduced to 20 frames (0.3s) for faster cleanup
+MAX_AGE = 1200 # Max frames before forced death (20 seconds)
+COMPLEXITY_CHECK_INTERVAL = 120 # Check GCM every 120 frames
+MIN_COMPLEXITY_THRESHOLD = 40 # Min GCM score to survive (increased from 10)
+STAGNATION_THRESHOLD = 50 # Cells must change per frame (increased from 20)
+STAGNATION_LIMIT = 10 # Only 10 frames of low activity allowed (reduced from 20)
 
 # Colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 GREEN = (50, 255, 50)
+
 
 # ==================== NEURAL NETWORK ====================
 class NeuralNetwork:
@@ -320,24 +324,25 @@ class EvolutionStrategy:
         
         return self.best_fitness
 
-    def save(self, filename="god_brain_es.json"):
+    def save(self, filename="god_brain_es.json", hall_of_fame=None):
         """Save the current ES state to disk"""
         data = {
             'mean_genome': self.mean_genome.tolist(),
             'best_genome': self.best_genome.tolist() if self.best_genome is not None else None,
             'best_fitness': float(self.best_fitness),
             'generation': self.generation,
-            'fitness_history': self.fitness_history
+            'fitness_history': self.fitness_history,
+            'hall_of_fame': [(float(score), genome.tolist()) for score, genome in hall_of_fame] if hall_of_fame else []
         }
         with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
-        print(f"Saved to {filename}")
+        print(f"Saved to {filename} (HoF: {len(hall_of_fame) if hall_of_fame else 0} genomes)")
     
     def load(self, filename="god_brain_es.json"):
         """Load ES state from disk"""
         if not os.path.exists(filename):
             print(f"No save file found at {filename}")
-            return False
+            return False, []
         
         with open(filename, 'r') as f:
             data = json.load(f)
@@ -352,8 +357,13 @@ class EvolutionStrategy:
         self.generation = data['generation']
         self.fitness_history = data['fitness_history']
         
-        print(f"Loaded from {filename} - Generation {self.generation}, Best Fitness: {self.best_fitness:.2f}")
-        return True
+        # Load Hall of Fame
+        hall_of_fame = []
+        if 'hall_of_fame' in data:
+            hall_of_fame = [(score, np.array(genome)) for score, genome in data['hall_of_fame']]
+        
+        print(f"Loaded from {filename} - Gen {self.generation}, Best: {self.best_fitness:.2f}, HoF: {len(hall_of_fame)}")
+        return True, hall_of_fame
 
 # ==================== MASSIVE GOD MODE ====================
 class MassiveGodMode:
@@ -384,6 +394,10 @@ class MassiveGodMode:
         self.stats_initial_pop = np.zeros((self.rows, self.cols), dtype=np.int32)
         self.stats_activity_accum = np.zeros((self.rows, self.cols), dtype=np.float32)
         self.stats_alive = np.ones((self.rows, self.cols), dtype=bool)
+        self.stats_last_gcm = np.zeros((self.rows, self.cols), dtype=np.float32)
+        
+        # Frame history for GCM calculation (store last N frames per game)
+        self.frame_history = [[[] for _ in range(self.cols)] for _ in range(self.rows)]
         
         # Population Management
         self.hall_of_fame = []
@@ -459,6 +473,8 @@ class MassiveGodMode:
         self.stats_initial_pop[r, c] = np.sum(seed)
         self.stats_activity_accum[r, c] = 0
         self.stats_alive[r, c] = True
+        self.stats_last_gcm[r, c] = 0.0
+        self.frame_history[r][c] = [seed.copy()]
 
     def update(self):
         # Game of Life Update
@@ -489,92 +505,161 @@ class MassiveGodMode:
         self.stats_age += 1
         self.stats_activity_accum += activity_per_game
         
-        is_stagnant = activity_per_game < STAGNATION_THRESHOLD
-        self.stats_stagnation[is_stagnant] += 1
-        self.stats_stagnation[~is_stagnant] = 0
+        # Update frame history for ALL games
+        for r in range(self.rows):
+            for c in range(self.cols):
+                y, x = r * GAME_SIZE, c * GAME_SIZE
+                game_grid = new_grid[y:y+GAME_SIZE, x:x+GAME_SIZE].copy()
+                
+                # Keep last 30 frames for GCM calculation
+                self.frame_history[r][c].append(game_grid)
+                if len(self.frame_history[r][c]) > 30:
+                    self.frame_history[r][c].pop(0)
         
-        # Identify Dead/Stagnant Games
-        dead_mask = (pop_per_game == 0)
-        stagnant_mask = (self.stats_stagnation > STAGNATION_LIMIT)
-        old_mask = (self.stats_age > MAX_AGE)
+        # Calculate GCM for one game per frame (rolling)
+        if hasattr(self, 'frame_count'):
+            total_games = self.rows * self.cols
+            game_index = self.frame_count % total_games
+            r = game_index // self.cols
+            c = game_index % self.cols
+            
+            # Calculate GCM if game has enough frames
+            if len(self.frame_history[r][c]) >= 10:
+                gcm = self.es.gol_complexity_metric(self.frame_history[r][c], k=8)
+                self.stats_last_gcm[r, c] = gcm
         
-        reset_mask = dead_mask | stagnant_mask | old_mask
+        # Identify games to reset based on GCM scores and basic conditions
+        dead_mask = (pop_per_game == 0)  # Truly dead (no cells)
+        old_mask = (self.stats_age > MAX_AGE)  # Too old
+        
+        # GCM-based reset: Games with low complexity OR that haven't been evaluated yet but are old enough
+        low_complexity_mask = np.zeros((self.rows, self.cols), dtype=bool)
+        for r in range(self.rows):
+            for c in range(self.cols):
+                # If game is old enough and has a GCM score
+                if self.stats_age[r, c] >= 100:  # At least 100 frames old
+                    gcm_score = self.stats_last_gcm[r, c]
+                    if gcm_score > 0 and gcm_score < MIN_COMPLEXITY_THRESHOLD:
+                        low_complexity_mask[r, c] = True
+        
+        reset_mask = dead_mask | old_mask | low_complexity_mask
         
         # Process Resets
         rows_to_reset, cols_to_reset = np.where(reset_mask)
         
         if hasattr(self, 'frame_count') and self.frame_count % 60 == 0 and len(rows_to_reset) > 0:
-            print(f"Reset Queue: {len(rows_to_reset)} games waiting.")
+            # Count reasons for reset
+            dead_count = np.sum(dead_mask)
+            old_count = np.sum(old_mask)
+            low_complex_count = np.sum(low_complexity_mask)
+            print(f"Reset Queue: {len(rows_to_reset)} (Dead:{dead_count} Old:{old_count} LowGCM:{low_complex_count})")
         elif not hasattr(self, 'frame_count'):
              self.frame_count = 0
         self.frame_count += 1
 
-        MAX_RESETS = 100
-        if len(rows_to_reset) > MAX_RESETS:
-            indices = np.random.choice(len(rows_to_reset), MAX_RESETS, replace=False)
-            rows_to_reset = rows_to_reset[indices]
-            cols_to_reset = cols_to_reset[indices]
-        
+        # Process ALL resets immediately (no limit)
         if len(rows_to_reset) > 0:
             for i in range(len(rows_to_reset)):
                 r, c = rows_to_reset[i], cols_to_reset[i]
                 
-                final_pop = pop_per_game[r, c]
-                initial_pop = self.stats_initial_pop[r, c]
-                duration = self.stats_age[r, c]
-                total_activity = self.stats_activity_accum[r, c]
+                # Calculate final GCM score for Hall of Fame
+                frames = self.frame_history[r][c]
+                if len(frames) >= 5:
+                    gcm_score = self.es.gol_complexity_metric(frames, k=8)
+                else:
+                    gcm_score = 0.0
                 
-                y, x = r * GAME_SIZE, c * GAME_SIZE
-                game_grid = new_grid[y:y+GAME_SIZE, x:x+GAME_SIZE]
-                
-                spread = 0
-                if final_pop > 0:
-                    rows, cols = np.where(game_grid == 1)
-                    if len(rows) > 0:
-                        h = np.max(rows) - np.min(rows) + 1
-                        w = np.max(cols) - np.min(cols) + 1
-                        spread = (h * w) / (GAME_SIZE * GAME_SIZE)
-                
-                score = duration * 1.0
-                score += total_activity * 0.5
-                if initial_pop > 0:
-                    score += (final_pop / initial_pop) * 10.0
-                score += spread * 50.0
-                
-                if initial_pop == 0: score -= 100
-                elif total_activity < 5: score -= 50
-                
-                score = max(score, 0)
-                
-                if score > 100:
+                # Add to Hall of Fame if complex enough
+                if gcm_score > MIN_COMPLEXITY_THRESHOLD:
                     genome = self.active_genomes[r][c].get_genome()
-                    self.hall_of_fame.append((score, genome))
+                    self.hall_of_fame.append((gcm_score, genome))
                     if len(self.hall_of_fame) > 100:
                         self.hall_of_fame.sort(key=lambda x: x[0], reverse=True)
                         self.hall_of_fame = self.hall_of_fame[:50]
                 
-                if score > self.best_fitness_ever:
-                    self.best_fitness_ever = score
+                if gcm_score > self.best_fitness_ever:
+                    self.best_fitness_ever = gcm_score
                 
                 self.reset_game(r, c, target_grid=new_grid)
         
         self.grid = new_grid
 
     def draw(self):
-        rgb_array = np.zeros((self.sim_width, self.sim_height, 3), dtype=np.uint8)
-        grid_t = self.grid.T
-        rgb_array[grid_t == 1] = [255, 255, 255]
+        # Create RGB array
+        rgb_array = np.zeros((self.sim_height, self.sim_width, 3), dtype=np.uint8)
+        
+        # Normalize GCM scores relative to current frame (min-max normalization)
+        active_scores = self.stats_last_gcm[self.stats_last_gcm > 0]
+        if len(active_scores) > 0:
+            min_gcm = np.min(active_scores)
+            max_gcm = np.max(active_scores)
+            
+            # Avoid division by zero
+            if max_gcm - min_gcm < 0.1:
+                normalized_scores = np.ones_like(self.stats_last_gcm) * 0.5
+            else:
+                # Normalize to 0-1 range based on current min/max
+                normalized_scores = np.clip((self.stats_last_gcm - min_gcm) / (max_gcm - min_gcm), 0, 1)
+        else:
+            normalized_scores = np.zeros_like(self.stats_last_gcm)
+        
+        # Smooth continuous color gradient: Blue -> Cyan -> Green -> Yellow -> Orange -> Red
+        for r in range(self.rows):
+            for c in range(self.cols):
+                y_start = r * GAME_SIZE
+                x_start = c * GAME_SIZE
+                
+                # Get normalized score (relative to current frame)
+                t = normalized_scores[r, c]
+                
+                # Convert from a smooth blue-to-red spectrum
+                if t < 0.2:  # Deep blue to cyan
+                    ratio = t / 0.2
+                    color = np.array([0, int(ratio * 255), 255])
+                elif t < 0.4:  # Cyan to green
+                    ratio = (t - 0.2) / 0.2
+                    color = np.array([0, 255, int((1 - ratio) * 255)])
+                elif t < 0.6:  # Green to yellow
+                    ratio = (t - 0.4) / 0.2
+                    color = np.array([int(ratio * 255), 255, 0])
+                elif t < 0.8:  # Yellow to orange
+                    ratio = (t - 0.6) / 0.2
+                    color = np.array([255, int((1 - ratio * 0.5) * 255), 0])
+                else:  # Orange to red
+                    ratio = (t - 0.8) / 0.2
+                    color = np.array([255, int((1 - ratio) * 128), 0])
+                
+                # Apply to this game's region (vectorized)
+                game_mask = self.grid[y_start:y_start+GAME_SIZE, x_start:x_start+GAME_SIZE]
+                rgb_array[y_start:y_start+GAME_SIZE, x_start:x_start+GAME_SIZE][game_mask == 1] = color
+        
+        # Transpose for pygame (pygame expects width, height order)
+        rgb_array = np.transpose(rgb_array, (1, 0, 2))
         
         pygame.surfarray.blit_array(self.screen, rgb_array)
         self.screen.blit(self.grid_overlay, (0, 0))
         
-        text = self.font.render(f"Best Fitness: {self.best_fitness_ever:.0f} | HoF Size: {len(self.hall_of_fame)}", True, GREEN)
+        # Update text to show GCM range
+        active_scores = self.stats_last_gcm[self.stats_last_gcm > 0]
+        if len(active_scores) > 0:
+            min_gcm_val = np.min(active_scores)
+            max_gcm_val = np.max(active_scores)
+            avg_gcm = np.mean(active_scores)
+        else:
+            min_gcm_val = max_gcm_val = avg_gcm = 0
+        
+        text = self.font.render(f"Best: {self.best_fitness_ever:.1f} | Range: {min_gcm_val:.1f}-{max_gcm_val:.1f} | Avg: {avg_gcm:.1f} | HoF: {len(self.hall_of_fame)}", True, WHITE)
         self.screen.blit(text, (20, 20))
         
         pygame.display.flip()
 
     def run(self):
-        self.es.load()
+        # Load ES state and Hall of Fame
+        success, loaded_hof = self.es.load()
+        if loaded_hof:
+            self.hall_of_fame = loaded_hof
+            self.best_fitness_ever = max([score for score, _ in loaded_hof]) if loaded_hof else 0
+            print(f"Restored Hall of Fame with {len(loaded_hof)} patterns, best: {self.best_fitness_ever:.2f}")
         
         running = True
         frame_counter = 0
@@ -594,12 +679,12 @@ class MassiveGodMode:
                 
                 frame_counter += 1
                 if frame_counter % 600 == 0:
-                    self.es.save()
+                    self.es.save(hall_of_fame=self.hall_of_fame)
         except KeyboardInterrupt:
             print("\nSaving progress...")
-            self.es.save()
+            self.es.save(hall_of_fame=self.hall_of_fame)
 
-        self.es.save()
+        self.es.save(hall_of_fame=self.hall_of_fame)
         pygame.quit()
         sys.exit()
 
